@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.dagster]
+module_name = "birdshot_hsrni.definitions"
+code_location_name = "birdshot_hsrni"
+
+[project]
+name = "birdshot_hsrni"
+version = "0.1.0"
+description = "g"
+authors = [
+    {name = "Jacob Hempel", email = "jacobhempel@tamu.edu"},
+    {name = "Kacper Kowalik (Xarthisius)", email = "xarthisius.kk@gmail.com"},
+]
+dependencies = [
+    "setuptools>=75.1.0",
+    "dagster",
+    "dagster-cloud",
+    "htmdec_formats @ git+https://github.com/htmdec/htmdec_formats.git",
+    "matplotlib",
+    "openpyxl",
+    "pandas",
+    "scipy",
+]
+requires-python = ">=3.12"
+readme = "README.md"
+license = {text = "BSD-3"}
+
+[project.optional-dependencies]
+dev = [
+    "dagster-webserver",
+    "pytest",
+]

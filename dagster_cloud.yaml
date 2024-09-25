@@ -1,0 +1,4 @@
+locations:
+  - location_name: birdshot_hsrni
+    code_source:
+      module_name: birdshot_hsrni.definitions
