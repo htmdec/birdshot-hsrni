@@ -7,8 +7,8 @@ all_assets = load_assets_from_modules([assets])
 
 defs = Definitions(
     assets=all_assets,
-    sensors=[assets.csr_2_sensor],
-    jobs=[assets.csr_2_files_job],
+    sensors=[assets.indentation_sensor],
+    jobs=[assets.indentation_job],
     resources={
         "girder": GirderConnection(
             credentials=GirderCredentials(
