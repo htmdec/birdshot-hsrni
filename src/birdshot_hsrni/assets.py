@@ -27,7 +27,7 @@ from .utils import calculate_H, export_CSR_laser_data
 
 indentation_partitions = DynamicPartitionsDefinition(name="indentation")
 
-INDENTATION_FILE_RE = re.compile(r"^[A-Z]{3}\d{2}_CSR_2_Test\d{3}\.zip$")
+INDENTATION_FILE_RE = re.compile(r"^[A-Z]{3}\d{2}.*\.zip$")
 
 SRC_FOLDER_ID = os.environ.get("GIRDER_SRC_FOLDER_ID", "")
 DST_FOLDER_ID = os.environ.get("GIRDER_DST_FOLDER_ID", "")
@@ -109,20 +109,24 @@ def load_instrument_parameters(context: AssetExecutionContext, fetch_indenter_ca
     description="Contact surface of individual indentations for CSR",
 )
 def extract_contact_area(context: AssetExecutionContext, girder: GirderConnection) -> float:
-    sample_id, test_part = context.partition_key.split("_CSR_2_Test")
-    test_num = int(test_part[:-4])
+    sample_id = context.partition_key.split("_")[0]
 
     items = girder.list_folder_items(SRC_FOLDER_ID)
-    cag_items = [i for i in items if i["name"].endswith("_area.cag")]
+    cag_items = [i for i in items if i["name"].startswith(sample_id) and i["name"].endswith(".cag")]
     cag_path = girder.download_item_to_tempfile(cag_items[0]["_id"], suffix=".cag")
 
     dataset = CAGDataset.from_filename(cag_path)
+    context.log.info(f"CAG measurements available: {list(dataset.measurements.keys())}")
+
     for filename, values in dataset.measurements.items():
-        if filename == f"{sample_id}_CSR_I{test_num:02d}":
+        if filename.startswith(sample_id):
             context.add_output_metadata({"sample_id": sample_id, "csa": values["csa"]})
             return float(values["csa"])
 
-    raise ValueError(f"No CAG measurement found for {sample_id}_CSR_I{test_num:02d}")
+    raise ValueError(
+        f"No CAG measurement found for sample {sample_id}. "
+        f"Available: {list(dataset.measurements.keys())}"
+    )
 
 
 @asset(partitions_def=indentation_partitions)
@@ -130,7 +134,7 @@ def fetch_raw_data(context: AssetExecutionContext, girder: GirderConnection) -> 
     filename = context.partition_key
     items = girder.list_folder_items(SRC_FOLDER_ID, name_regex=re.escape(filename))
     fname = girder.download_item_to_tempfile(items[0]["_id"], suffix=".zip")
-    sample_id = filename.split("_CSR_2_Test")[0]
+    sample_id = filename.split("_")[0]
     context.add_output_metadata({"sample_id": sample_id, "iteration_id": sample_id[:3]})
     return fname
 
@@ -235,8 +239,8 @@ def export_results(
     girder: GirderConnection,
 ) -> None:
     key = context.partition_key
-    test_num = int(key.split("_CSR_2_Test")[1][:-4])
-    output_path = f"/tmp/{key[:-4]}.xlsx"
+    stem = key[:-4]
+    output_path = f"/tmp/{stem}.xlsx"
 
     load_instrument_parameters.to_excel(output_path, sheet_name="Analysis Inputs")
 
@@ -253,9 +257,9 @@ def export_results(
         np.column_stack((hc_over_h, 0)), columns=["hc_over_h", ""]
     )
     with pd.ExcelWriter(output_path, engine="openpyxl", mode="a") as writer:
-        df_results.to_excel(writer, sheet_name=f"Test {test_num}", index=False)
+        df_results.to_excel(writer, sheet_name=stem, index=False)
         df_results_hc_over_h.to_excel(
-            writer, sheet_name=f"Test {test_num} hc_over_h", index=False
+            writer, sheet_name=f"{stem} hc_over_h", index=False
         )
 
     filename = key.replace(".zip", ".xlsx")
