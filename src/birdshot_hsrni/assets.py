@@ -1,8 +1,9 @@
-import glob
 import os
 import re
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Tuple, TypedDict
 
+import dagster as dg
 import numpy as np
 import pandas as pd
 from dagster import (
@@ -13,7 +14,6 @@ from dagster import (
     Output,
     RunRequest,
     SensorEvaluationContext,
-    SensorResult,
     asset,
     define_asset_job,
     multi_asset,
@@ -21,12 +21,21 @@ from dagster import (
 )
 from htmdec_formats import CAGDataset
 
+from .resources import GirderConnection
 from .utils import calculate_H, export_CSR_laser_data
 
 csr_2_partitions = DynamicPartitionsDefinition(name="csr_2")
 
-csr_2_file = re.compile(r"^[A-Z]{3}\d{2}_CSR_2_Test\d{3}.zip$")
-DATA_PATH = os.environ.get("DATA_PATH", "/home/xarth/codes/htmdec/Jacob_workflow/data")
+CSR2_FILE_RE = re.compile(r"^[A-Z]{3}\d{2}_CSR_2_Test\d{3}\.zip$")
+
+SRC_FOLDER_ID = os.environ.get("GIRDER_SRC_FOLDER_ID", "")
+DST_FOLDER_ID = os.environ.get("GIRDER_DST_FOLDER_ID", "")
+
+_ACTIVE_RUN_STATUSES = [
+    dg.DagsterRunStatus.QUEUED,
+    dg.DagsterRunStatus.STARTING,
+    dg.DagsterRunStatus.STARTED,
+]
 
 
 class FormData(TypedDict):
@@ -39,7 +48,6 @@ class FormData(TypedDict):
 
 @asset(description="Input parameters from the DMS form")
 def form_data():
-    # Get data from Form
     return {
         "sample_id": "BAA01",
         "iteration_id": "BAA",
@@ -90,9 +98,12 @@ def analysis_inputs(context: AssetExecutionContext, form_data) -> Output[pd.Data
 
 
 @asset(description="Microscope data in .cag format")
-def area_cag(context: AssetExecutionContext):
-    fname = glob.glob(f"{DATA_PATH}/*_area.cag")[0]
-    sample_id = os.path.basename(fname).split("_")[0]
+def area_cag(context: AssetExecutionContext, girder: GirderConnection):
+    items = girder.list_folder_items(SRC_FOLDER_ID)
+    cag_items = [i for i in items if i["name"].endswith("_area.cag")]
+    item = cag_items[0]
+    fname = girder.download_item_to_tempfile(item["_id"], suffix=".cag")
+    sample_id = item["name"].split("_")[0]
     context.add_output_metadata({"sample_id": sample_id, "iteration_id": sample_id[:3]})
     return fname
 
@@ -128,10 +139,13 @@ def am_csr_2(context: AssetExecutionContext, area_measurement: pd.DataFrame) -> 
 
 
 @asset(partitions_def=csr_2_partitions)
-def csr_2_files(context: AssetExecutionContext) -> str:
-    sample_id = context.partition_key.split("_CSR_2_Test")[0]
+def csr_2_files(context: AssetExecutionContext, girder: GirderConnection) -> str:
+    filename = context.partition_key
+    items = girder.list_folder_items(SRC_FOLDER_ID, name_regex=re.escape(filename))
+    fname = girder.download_item_to_tempfile(items[0]["_id"], suffix=".zip")
+    sample_id = filename.split("_CSR_2_Test")[0]
     context.add_output_metadata({"sample_id": sample_id, "iteration_id": sample_id[:3]})
-    return os.path.join(DATA_PATH, context.partition_key)
+    return fname
 
 
 @multi_asset(
@@ -170,22 +184,10 @@ def measured_quantities(
         }
     )
     return (
-        Output(
-            df["Time (s)"].to_frame(),
-            metadata={"preview": df["Time (s)"].to_markdown()},
-        ),
-        Output(
-            df["Load (N)"].to_frame(),
-            metadata={"preview": df["Load (N)"].to_markdown()},
-        ),
-        Output(
-            df["Displacement (mm)"].to_frame(),
-            metadata={"preview": df["Displacement (mm)"].to_markdown()},
-        ),
-        Output(
-            df["SR (mm/s)"].to_frame(),
-            metadata={"preview": df["SR (mm/s)"].to_markdown()},
-        ),
+        Output(df["Time (s)"].to_frame(), metadata={"preview": df["Time (s)"].to_markdown()}),
+        Output(df["Load (N)"].to_frame(), metadata={"preview": df["Load (N)"].to_markdown()}),
+        Output(df["Displacement (mm)"].to_frame(), metadata={"preview": df["Displacement (mm)"].to_markdown()}),
+        Output(df["SR (mm/s)"].to_frame(), metadata={"preview": df["SR (mm/s)"].to_markdown()}),
     )
 
 
@@ -216,29 +218,15 @@ def computed_quantities(
         area_coefficients,
         area_max_depth=am_csr_2,
     )
-    df = pd.DataFrame(
-        {
-            "Hardness (GPa)": H,
-            "Area (nm^2)": A,
-        }
-    )
+    df = pd.DataFrame({"Hardness (GPa)": H, "Area (nm^2)": A})
     return (
-        Output(
-            df["Hardness (GPa)"].to_frame(),
-            metadata={"preview": df["Hardness (GPa)"].to_markdown()},
-        ),
-        Output(
-            df["Area (nm^2)"].to_frame(),
-            metadata={"preview": df["Area (nm^2)"].to_markdown()},
-        ),
-        Output(
-            pd.Series([hc_over_h], name="hc/h"),
-            metadata={"preview": f"hc/h: {hc_over_h}"},
-        ),
+        Output(df["Hardness (GPa)"].to_frame(), metadata={"preview": df["Hardness (GPa)"].to_markdown()}),
+        Output(df["Area (nm^2)"].to_frame(), metadata={"preview": df["Area (nm^2)"].to_markdown()}),
+        Output(pd.Series([hc_over_h], name="hc/h"), metadata={"preview": f"hc/h: {hc_over_h}"}),
     )
 
 
-csr_2_job = define_asset_job(
+csr_2_files_job = define_asset_job(
     "csr_2_files_job",
     AssetSelection.assets("csr_2_files"),
     partitions_def=csr_2_partitions,
@@ -256,62 +244,77 @@ def csr_2_summary(
     area: Dict[str, pd.DataFrame],
     strain_rate: Dict[str, pd.DataFrame],
     analysis_inputs: pd.DataFrame,
+    girder: GirderConnection,
 ) -> None:
-    analysis_inputs.to_excel("/tmp/foo.xlsx", sheet_name="Analysis Inputs")
+    output_path = "/tmp/csr_2_summary.xlsx"
+    analysis_inputs.to_excel(output_path, sheet_name="Analysis Inputs")
     for key in sorted(hardness.keys()):
         test_num = int(key.split("_CSR_2_Test")[1][:-4])
-        # The rest compiles the columns of data into a pandas dataframe
-        # outputs this into the excel file.
         df_results = pd.concat(
-            [
-                time[key],
-                displacement[key],
-                load[key],
-                hardness[key],
-                area[key],
-                strain_rate[key],
-            ],
+            [time[key], displacement[key], load[key], hardness[key], area[key], strain_rate[key]],
             axis=1,
             sort=False,
         )
-        df_results.columns = [
-            "TIME",
-            "DEPTH",
-            "LOAD",
-            "HARDNESS",
-            "AREA",
-            "STRAIN RATE",
-        ]
+        df_results.columns = ["TIME", "DEPTH", "LOAD", "HARDNESS", "AREA", "STRAIN RATE"]
         df_results.loc[-1] = ["s", "nm", "mN", "GPa", "nm^2", "s^-1"]
         df_results.index = df_results.index + 1
         df_results = df_results.sort_index()
         df_results_hc_over_h = pd.DataFrame(
             np.column_stack((hc_over_h[key], 0)), columns=["hc_over_h", ""]
         )
-        with pd.ExcelWriter("/tmp/foo.xlsx", engine="openpyxl", mode="a") as writer:
+        with pd.ExcelWriter(output_path, engine="openpyxl", mode="a") as writer:
             df_results.to_excel(writer, sheet_name=f"Test {test_num}", index=False)
             df_results_hc_over_h.to_excel(
                 writer, sheet_name=f"Test {test_num} hc_over_h", index=False
             )
-    return
 
-
-@sensor(job=csr_2_job)
-def csr_2_sensor(context: SensorEvaluationContext):
-    new_csr_2_files = [
-        filename
-        for filename in os.listdir(DATA_PATH)
-        if csr_2_file.match(filename)
-        and not csr_2_partitions.has_partition_key(
-            filename, dynamic_partitions_store=context.instance
-        )
-    ]
-
-    return SensorResult(
-        run_requests=[
-            RunRequest(partition_key=filename) for filename in new_csr_2_files
-        ],
-        dynamic_partitions_requests=[
-            csr_2_partitions.build_add_request(new_csr_2_files)
-        ],
+    girder.upload_file_to_folder(
+        DST_FOLDER_ID,
+        output_path,
+        mime_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename="csr_2_summary.xlsx",
     )
+    context.add_output_metadata({"output_filename": "csr_2_summary.xlsx"})
+
+
+@sensor(job=csr_2_files_job, minimum_interval_seconds=60)
+def csr_2_sensor(context: SensorEvaluationContext, girder: GirderConnection):
+    last_poll = context.cursor or "1970-01-01T00:00:00.000000+00:00"
+
+    items = girder.list_folder_items(SRC_FOLDER_ID, name_regex=CSR2_FILE_RE.pattern)
+    new_items = [i for i in items if i["created"] > last_poll]
+
+    if not new_items:
+        return None
+
+    existing = context.instance.get_dynamic_partitions(csr_2_partitions.name)
+    new_partition_keys = []
+    run_requests = []
+
+    for item in new_items:
+        key = item["name"]
+        if key not in existing:
+            new_partition_keys.append(key)
+            existing.append(key)
+
+        active = context.instance.get_runs(
+            filters=dg.RunsFilter(
+                job_name="csr_2_files_job",
+                statuses=_ACTIVE_RUN_STATUSES,
+                tags={"dagster/partition": key},
+            )
+        )
+        if active:
+            context.log.debug(
+                f"Skipping partition {key!r}: run {active[0].run_id} is already active."
+            )
+            continue
+        run_requests.append(RunRequest(partition_key=key))
+
+    if new_partition_keys:
+        context.instance.add_dynamic_partitions(csr_2_partitions.name, new_partition_keys)
+
+    context.update_cursor(
+        (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+    )
+    return run_requests
