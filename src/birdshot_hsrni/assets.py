@@ -109,24 +109,25 @@ def load_instrument_parameters(context: AssetExecutionContext, fetch_indenter_ca
     description="Contact surface of individual indentations for CSR",
 )
 def extract_contact_area(context: AssetExecutionContext, girder: GirderConnection) -> float:
-    sample_id = context.partition_key.split("_")[0]
+    # CBC06_CSR_2_Test001.zip -> prefix=CBC06_CSR_2, test_num=1 -> CBC06_CSR_2_I01
+    match = re.match(r"^(.+)_Test(\d+)\.zip$", context.partition_key)
+    prefix, test_num = match.group(1), int(match.group(2))
+    cag_key = f"{prefix}_I{test_num:02d}"
 
     items = girder.list_folder_items(SRC_FOLDER_ID)
-    cag_items = [i for i in items if i["name"].startswith(sample_id) and i["name"].endswith(".cag")]
+    cag_items = [i for i in items if i["name"].endswith(".cag")]
     cag_path = girder.download_item_to_tempfile(cag_items[0]["_id"], suffix=".cag")
 
     dataset = CAGDataset.from_filename(cag_path)
-    context.log.info(f"CAG measurements available: {list(dataset.measurements.keys())}")
+    if cag_key not in dataset.measurements:
+        raise ValueError(
+            f"No CAG measurement found for {cag_key}. "
+            f"Available: {list(dataset.measurements.keys())}"
+        )
 
-    for filename, values in dataset.measurements.items():
-        if filename.startswith(sample_id):
-            context.add_output_metadata({"sample_id": sample_id, "csa": values["csa"]})
-            return float(values["csa"])
-
-    raise ValueError(
-        f"No CAG measurement found for sample {sample_id}. "
-        f"Available: {list(dataset.measurements.keys())}"
-    )
+    csa = float(dataset.measurements[cag_key]["csa"])
+    context.add_output_metadata({"cag_key": cag_key, "csa": csa})
+    return csa
 
 
 @asset(partitions_def=indentation_partitions)
