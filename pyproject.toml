@@ -9,7 +9,7 @@ code_location_name = "birdshot_hsrni"
 [project]
 name = "birdshot_hsrni"
 version = "0.1.0"
-description = "g"
+description = "Dagster pipeline for automated nanoindentation analysis on HTMDEC BIRDSHOT samples"
 authors = [
     {name = "Jacob Hempel", email = "jacobhempel@tamu.edu"},
     {name = "Kacper Kowalik (Xarthisius)", email = "xarthisius.kk@gmail.com"},
@@ -20,7 +20,6 @@ dependencies = [
     "dagster-cloud",
     "girder-client",
     "htmdec_formats @ git+https://github.com/htmdec/htmdec_formats.git",
-    "matplotlib",
     "openpyxl",
     "pandas",
     "scipy",
