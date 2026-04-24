@@ -27,7 +27,7 @@ from .utils import calculate_H, export_CSR_laser_data
 
 indentation_partitions = DynamicPartitionsDefinition(name="indentation")
 
-INDENTATION_FILE_RE = re.compile(r"^[A-Z]{3}\d{2}.*\.zip$")
+INDENTATION_FILE_RE = re.compile(r".*\.zip$")
 
 SRC_FOLDER_ID = os.environ.get("GIRDER_SRC_FOLDER_ID", "")
 DST_FOLDER_ID = os.environ.get("GIRDER_DST_FOLDER_ID", "")
