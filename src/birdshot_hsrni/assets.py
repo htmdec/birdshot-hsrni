@@ -7,6 +7,7 @@ import dagster as dg
 import numpy as np
 import pandas as pd
 from dagster import (
+    AssetKey,
     AutoMaterializePolicy,
     AssetExecutionContext,
     AssetOut,
@@ -100,30 +101,34 @@ def load_instrument_parameters(
 
 
 @asset(
-    partitions_def=indentation_partitions,
-    description="Contact surface of individual indentations for CSR",
+    description="Area measurements parsed from the sample's .cag microscopy file",
+    auto_materialize_policy=AutoMaterializePolicy.eager(),
 )
-def extract_contact_area(
-    context: AssetExecutionContext, girder: GirderConnection
-) -> float:
-    match = re.match(r"^(.+)_Test(\d+)\.zip$", context.partition_key)
-    prefix, test_num = match.group(1), int(match.group(2))
-    cag_key = f"{prefix}_I{test_num:02d}"
-
+def fetch_cag(girder: GirderConnection) -> dict:
     items = girder.list_folder_items(SRC_FOLDER_ID)
     cag_items = [i for i in items if i["name"].endswith(".cag")]
     if not cag_items:
         raise FileNotFoundError(f"No .cag file found in source folder {SRC_FOLDER_ID}")
     cag_path = girder.download_item_to_tempfile(cag_items[0]["_id"], suffix=".cag")
+    return dict(CAGDataset.from_filename(cag_path).measurements)
 
-    dataset = CAGDataset.from_filename(cag_path)
-    if cag_key not in dataset.measurements:
+
+@asset(
+    partitions_def=indentation_partitions,
+    description="Contact surface area for this indentation, looked up from the CAG measurements",
+)
+def extract_contact_area(context: AssetExecutionContext, fetch_cag: dict) -> float:
+    match = re.match(r"^(.+)_Test(\d+)\.zip$", context.partition_key)
+    prefix, test_num = match.group(1), int(match.group(2))
+    cag_key = f"{prefix}_I{test_num:02d}"
+
+    if cag_key not in fetch_cag:
         raise ValueError(
             f"No CAG measurement found for {cag_key}. "
-            f"Available: {list(dataset.measurements.keys())}"
+            f"Available: {list(fetch_cag.keys())}"
         )
 
-    csa = float(dataset.measurements[cag_key]["csa"])
+    csa = float(fetch_cag[cag_key]["csa"])
     context.add_output_metadata({"cag_key": cag_key, "csa": csa})
     return csa
 
@@ -133,7 +138,9 @@ def fetch_raw_data(context: AssetExecutionContext, girder: GirderConnection) -> 
     filename = context.partition_key
     items = girder.list_folder_items(SRC_FOLDER_ID, name_regex=re.escape(filename))
     if not items:
-        raise FileNotFoundError(f"No file named {filename!r} found in source folder {SRC_FOLDER_ID}")
+        raise FileNotFoundError(
+            f"No file named {filename!r} found in source folder {SRC_FOLDER_ID}"
+        )
     fname = girder.download_item_to_tempfile(items[0]["_id"], suffix=".zip")
     sample_id = filename.split("_")[0]
     context.add_output_metadata({"sample_id": sample_id, "iteration_id": sample_id[:3]})
@@ -300,8 +307,15 @@ def export_results(
     context.add_output_metadata({"output_filename": filename})
 
 
-@sensor(job=indentation_job, minimum_interval_seconds=60)
+@sensor(job=indentation_job, minimum_interval_seconds=30)
 def indentation_sensor(context: SensorEvaluationContext, girder: GirderConnection):
+    for prereq in ("fetch_cag", "load_instrument_parameters"):
+        if not context.instance.get_latest_materialization_event(AssetKey(prereq)):
+            context.log.info(
+                f"Waiting for {prereq!r} to be materialized before triggering runs."
+            )
+            return None
+
     last_poll = context.cursor or "1970-01-01T00:00:00.000000+00:00"
 
     items = girder.list_folder_items(
