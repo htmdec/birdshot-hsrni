@@ -53,9 +53,15 @@ dagster dev
 
 ### In the Dagster UI (http://localhost:3000)
 
-Go to **Automation** and start both sensors:
-- **indentation_sensor** — watches for new ZIP files and triggers the analysis pipeline
-- **default_automation_condition_sensor** — materializes instrument calibration parameters on startup
+Go to **Automation** and start both sensors.
+
+The pipeline has two shared prerequisites that must be materialized before any per-test run can start:
+- **Instrument calibration parameters** — actuator spring coefficient, area function coefficients, frame stiffness
+- **CAG area measurements** — downloaded once from the source folder and parsed into a lookup table used by every test
+
+These are materialized automatically when the automation sensors are enabled. The **indentation sensor** will not fire run requests until both are ready — it checks on every tick and waits if either is missing.
+
+Once the prerequisites are in place, the sensor polls for new ZIP files every 60 seconds and triggers a full analysis run for each one automatically.
 
 Results are uploaded to the destination Girder folder as `{zip_stem}.xlsx` (e.g. `CBC06_CSR_2_Test001.xlsx`).
 
