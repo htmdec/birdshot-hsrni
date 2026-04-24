@@ -1,6 +1,6 @@
 import os
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Tuple
 
 import dagster as dg
@@ -336,6 +336,12 @@ def indentation_sensor(context: SensorEvaluationContext, girder: GirderConnectio
             new_partition_keys.append(key)
             existing.append(key)
 
+        if context.instance.get_latest_materialization_event(
+            AssetKey("export_results"), partition_key=key
+        ):
+            context.log.debug(f"Skipping partition {key!r}: already materialized.")
+            continue
+
         active = context.instance.get_runs(
             filters=dg.RunsFilter(
                 job_name="indentation_job",
@@ -355,7 +361,5 @@ def indentation_sensor(context: SensorEvaluationContext, girder: GirderConnectio
             indentation_partitions.name, new_partition_keys
         )
 
-    context.update_cursor(
-        (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
-    )
+    context.update_cursor(datetime.now(timezone.utc).isoformat())
     return run_requests
