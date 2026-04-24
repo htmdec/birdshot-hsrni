@@ -1,7 +1,7 @@
 import os
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Tuple, TypedDict
+from typing import Tuple
 
 import dagster as dg
 import numpy as np
@@ -39,14 +39,6 @@ _ACTIVE_RUN_STATUSES = [
 ]
 
 
-class FormData(TypedDict):
-    sample_id: str
-    iteration_id: int
-    actuator_parameters: Dict[str, float]
-    area_coefficients: Dict[str, float]
-    frame_stiffness: float
-
-
 @asset(
     description="Input parameters from the DMS form",
     auto_materialize_policy=AutoMaterializePolicy.eager(),
@@ -74,12 +66,15 @@ def fetch_indenter_calibration():
 
 
 @asset(
-    description="DataFrame with analysis inputs for the CSR_2 tests",
+    description="DataFrame with analysis inputs for the CSR tests",
     auto_materialize_policy=AutoMaterializePolicy.eager(),
 )
-def load_instrument_parameters(context: AssetExecutionContext, fetch_indenter_calibration) -> Output[pd.DataFrame]:
+def load_instrument_parameters(
+    context: AssetExecutionContext, fetch_indenter_calibration
+) -> Output[pd.DataFrame]:
     actuator_parameters = np.array(
-        list(fetch_indenter_calibration["actuator_parameters"].values()), dtype=np.float64
+        list(fetch_indenter_calibration["actuator_parameters"].values()),
+        dtype=np.float64,
     )
     area_coefficients = np.array(
         list(fetch_indenter_calibration["area_coefficients"].values()), dtype=np.float64
@@ -97,9 +92,9 @@ def load_instrument_parameters(context: AssetExecutionContext, fetch_indenter_ca
         columns=["Actuator parameters", "Tip area coefficients"],
         index=input_df_index,
     )
-    input_df.loc[input_df.index[0], "Frame Stiffness (N/m)"] = fetch_indenter_calibration[
-        "frame_stiffness"
-    ]
+    input_df.loc[input_df.index[0], "Frame Stiffness (N/m)"] = (
+        fetch_indenter_calibration["frame_stiffness"]
+    )
     context.log.info(f"Input data: {input_df.head()}")
     return Output(input_df, metadata={"preview": input_df.to_markdown()})
 
@@ -108,14 +103,17 @@ def load_instrument_parameters(context: AssetExecutionContext, fetch_indenter_ca
     partitions_def=indentation_partitions,
     description="Contact surface of individual indentations for CSR",
 )
-def extract_contact_area(context: AssetExecutionContext, girder: GirderConnection) -> float:
-    # CBC06_CSR_2_Test001.zip -> prefix=CBC06_CSR_2, test_num=1 -> CBC06_CSR_2_I01
+def extract_contact_area(
+    context: AssetExecutionContext, girder: GirderConnection
+) -> float:
     match = re.match(r"^(.+)_Test(\d+)\.zip$", context.partition_key)
     prefix, test_num = match.group(1), int(match.group(2))
     cag_key = f"{prefix}_I{test_num:02d}"
 
     items = girder.list_folder_items(SRC_FOLDER_ID)
     cag_items = [i for i in items if i["name"].endswith(".cag")]
+    if not cag_items:
+        raise FileNotFoundError(f"No .cag file found in source folder {SRC_FOLDER_ID}")
     cag_path = girder.download_item_to_tempfile(cag_items[0]["_id"], suffix=".cag")
 
     dataset = CAGDataset.from_filename(cag_path)
@@ -134,6 +132,8 @@ def extract_contact_area(context: AssetExecutionContext, girder: GirderConnectio
 def fetch_raw_data(context: AssetExecutionContext, girder: GirderConnection) -> str:
     filename = context.partition_key
     items = girder.list_folder_items(SRC_FOLDER_ID, name_regex=re.escape(filename))
+    if not items:
+        raise FileNotFoundError(f"No file named {filename!r} found in source folder {SRC_FOLDER_ID}")
     fname = girder.download_item_to_tempfile(items[0]["_id"], suffix=".zip")
     sample_id = filename.split("_")[0]
     context.add_output_metadata({"sample_id": sample_id, "iteration_id": sample_id[:3]})
@@ -143,7 +143,7 @@ def fetch_raw_data(context: AssetExecutionContext, girder: GirderConnection) -> 
 @multi_asset(
     name="extract_indentation_signals",
     partitions_def=indentation_partitions,
-    description="Time, Load, Displacement, and SR extracted from CSR_2 data",
+    description="Time, Load, Displacement, and SR extracted from CSR data",
     outs={
         "time": AssetOut(metadata={"quantity": "Time (s)"}),
         "load": AssetOut(metadata={"quantity": "Load (N)"}),
@@ -153,7 +153,9 @@ def fetch_raw_data(context: AssetExecutionContext, girder: GirderConnection) -> 
     group_name="extract_indentation_signals",
 )
 def extract_indentation_signals(
-    context: AssetExecutionContext, fetch_raw_data: str, load_instrument_parameters: pd.DataFrame
+    context: AssetExecutionContext,
+    fetch_raw_data: str,
+    load_instrument_parameters: pd.DataFrame,
 ) -> Tuple[
     Output[pd.DataFrame],
     Output[pd.DataFrame],
@@ -163,7 +165,9 @@ def extract_indentation_signals(
     time, load, displacement, SR = export_CSR_laser_data(
         fetch_raw_data,
         load_instrument_parameters["Actuator parameters"].values,
-        Kf=load_instrument_parameters.loc[load_instrument_parameters.index[0], "Frame Stiffness (N/m)"],
+        Kf=load_instrument_parameters.loc[
+            load_instrument_parameters.index[0], "Frame Stiffness (N/m)"
+        ],
         downsample=True,
         downsample_hop=500,
     )
@@ -176,17 +180,29 @@ def extract_indentation_signals(
         }
     )
     return (
-        Output(df["Time (s)"].to_frame(), metadata={"preview": df["Time (s)"].to_markdown()}),
-        Output(df["Load (N)"].to_frame(), metadata={"preview": df["Load (N)"].to_markdown()}),
-        Output(df["Displacement (mm)"].to_frame(), metadata={"preview": df["Displacement (mm)"].to_markdown()}),
-        Output(df["SR (mm/s)"].to_frame(), metadata={"preview": df["SR (mm/s)"].to_markdown()}),
+        Output(
+            df["Time (s)"].to_frame(),
+            metadata={"preview": df["Time (s)"].to_markdown()},
+        ),
+        Output(
+            df["Load (N)"].to_frame(),
+            metadata={"preview": df["Load (N)"].to_markdown()},
+        ),
+        Output(
+            df["Displacement (mm)"].to_frame(),
+            metadata={"preview": df["Displacement (mm)"].to_markdown()},
+        ),
+        Output(
+            df["SR (mm/s)"].to_frame(),
+            metadata={"preview": df["SR (mm/s)"].to_markdown()},
+        ),
     )
 
 
 @multi_asset(
     name="compute_mechanical_properties",
     partitions_def=indentation_partitions,
-    description="Calculate Hardness and Contact Area from CSR_2 data",
+    description="Calculate Hardness and Contact Area from CSR data",
     outs={
         "hardness": AssetOut(metadata={"quantity": "Hardness (GPa)"}),
         "area": AssetOut(metadata={"quantity": "Area (nm^2)"}),
@@ -212,16 +228,27 @@ def compute_mechanical_properties(
     )
     df = pd.DataFrame({"Hardness (GPa)": H, "Area (nm^2)": A})
     return (
-        Output(df["Hardness (GPa)"].to_frame(), metadata={"preview": df["Hardness (GPa)"].to_markdown()}),
-        Output(df["Area (nm^2)"].to_frame(), metadata={"preview": df["Area (nm^2)"].to_markdown()}),
-        Output(pd.Series([hc_over_h], name="hc/h"), metadata={"preview": f"hc/h: {hc_over_h}"}),
+        Output(
+            df["Hardness (GPa)"].to_frame(),
+            metadata={"preview": df["Hardness (GPa)"].to_markdown()},
+        ),
+        Output(
+            df["Area (nm^2)"].to_frame(),
+            metadata={"preview": df["Area (nm^2)"].to_markdown()},
+        ),
+        Output(
+            pd.Series([hc_over_h], name="hc/h"),
+            metadata={"preview": f"hc/h: {hc_over_h}"},
+        ),
     )
 
 
 indentation_job = define_asset_job(
     "indentation_job",
     AssetSelection.assets("fetch_raw_data", "extract_contact_area", "export_results")
-    | AssetSelection.groups("extract_indentation_signals", "compute_mechanical_properties"),
+    | AssetSelection.groups(
+        "extract_indentation_signals", "compute_mechanical_properties"
+    ),
     partitions_def=indentation_partitions,
 )
 
@@ -277,7 +304,9 @@ def export_results(
 def indentation_sensor(context: SensorEvaluationContext, girder: GirderConnection):
     last_poll = context.cursor or "1970-01-01T00:00:00.000000+00:00"
 
-    items = girder.list_folder_items(SRC_FOLDER_ID, name_regex=INDENTATION_FILE_RE.pattern)
+    items = girder.list_folder_items(
+        SRC_FOLDER_ID, name_regex=INDENTATION_FILE_RE.pattern
+    )
     new_items = [i for i in items if i["created"] > last_poll]
 
     if not new_items:
@@ -308,7 +337,9 @@ def indentation_sensor(context: SensorEvaluationContext, girder: GirderConnectio
         run_requests.append(RunRequest(partition_key=key))
 
     if new_partition_keys:
-        context.instance.add_dynamic_partitions(indentation_partitions.name, new_partition_keys)
+        context.instance.add_dynamic_partitions(
+            indentation_partitions.name, new_partition_keys
+        )
 
     context.update_cursor(
         (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
