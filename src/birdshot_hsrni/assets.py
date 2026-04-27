@@ -1,11 +1,14 @@
-import glob
 import os
 import re
-from typing import Dict, Tuple, TypedDict
+from datetime import datetime, timezone
+from typing import Tuple
 
+import dagster as dg
 import numpy as np
 import pandas as pd
 from dagster import (
+    AssetKey,
+    AutoMaterializePolicy,
     AssetExecutionContext,
     AssetOut,
     AssetSelection,
@@ -13,7 +16,6 @@ from dagster import (
     Output,
     RunRequest,
     SensorEvaluationContext,
-    SensorResult,
     asset,
     define_asset_job,
     multi_asset,
@@ -21,25 +23,28 @@ from dagster import (
 )
 from htmdec_formats import CAGDataset
 
+from .resources import GirderConnection
 from .utils import calculate_H, export_CSR_laser_data
 
-csr_2_partitions = DynamicPartitionsDefinition(name="csr_2")
+indentation_partitions = DynamicPartitionsDefinition(name="indentation")
 
-csr_2_file = re.compile(r"^[A-Z]{3}\d{2}_CSR_2_Test\d{3}.zip$")
-DATA_PATH = os.environ.get("DATA_PATH", "/home/xarth/codes/htmdec/Jacob_workflow/data")
+INDENTATION_FILE_RE = re.compile(r".*\.zip$")
+
+SRC_FOLDER_ID = os.environ.get("GIRDER_SRC_FOLDER_ID", "")
+DST_FOLDER_ID = os.environ.get("GIRDER_DST_FOLDER_ID", "")
+
+_ACTIVE_RUN_STATUSES = [
+    dg.DagsterRunStatus.QUEUED,
+    dg.DagsterRunStatus.STARTING,
+    dg.DagsterRunStatus.STARTED,
+]
 
 
-class FormData(TypedDict):
-    sample_id: str
-    iteration_id: int
-    actuator_parameters: Dict[str, float]
-    area_coefficients: Dict[str, float]
-    frame_stiffness: float
-
-
-@asset(description="Input parameters from the DMS form")
-def form_data():
-    # Get data from Form
+@asset(
+    description="Input parameters from the DMS form",
+    auto_materialize_policy=AutoMaterializePolicy.eager(),
+)
+def fetch_indenter_calibration():
     return {
         "sample_id": "BAA01",
         "iteration_id": "BAA",
@@ -61,13 +66,19 @@ def form_data():
     }
 
 
-@asset(description="DataFrame with analysis inputs for the CSR_2 tests")
-def analysis_inputs(context: AssetExecutionContext, form_data) -> Output[pd.DataFrame]:
+@asset(
+    description="DataFrame with analysis inputs for the CSR tests",
+    auto_materialize_policy=AutoMaterializePolicy.eager(),
+)
+def load_instrument_parameters(
+    context: AssetExecutionContext, fetch_indenter_calibration
+) -> Output[pd.DataFrame]:
     actuator_parameters = np.array(
-        list(form_data["actuator_parameters"].values()), dtype=np.float64
+        list(fetch_indenter_calibration["actuator_parameters"].values()),
+        dtype=np.float64,
     )
     area_coefficients = np.array(
-        list(form_data["area_coefficients"].values()), dtype=np.float64
+        list(fetch_indenter_calibration["area_coefficients"].values()), dtype=np.float64
     )
     test_input_data_array = np.column_stack((actuator_parameters, area_coefficients))
     input_df_index = [
@@ -82,72 +93,76 @@ def analysis_inputs(context: AssetExecutionContext, form_data) -> Output[pd.Data
         columns=["Actuator parameters", "Tip area coefficients"],
         index=input_df_index,
     )
-    input_df.loc[input_df.index[0], "Frame Stiffness (N/m)"] = form_data[
-        "frame_stiffness"
-    ]
+    input_df.loc[input_df.index[0], "Frame Stiffness (N/m)"] = (
+        fetch_indenter_calibration["frame_stiffness"]
+    )
     context.log.info(f"Input data: {input_df.head()}")
     return Output(input_df, metadata={"preview": input_df.to_markdown()})
 
 
-@asset(description="Microscope data in .cag format")
-def area_cag(context: AssetExecutionContext):
-    fname = glob.glob(f"{DATA_PATH}/*_area.cag")[0]
-    sample_id = os.path.basename(fname).split("_")[0]
+@asset(
+    description="Area measurements parsed from the sample's .cag microscopy file",
+    auto_materialize_policy=AutoMaterializePolicy.eager(),
+)
+def fetch_cag(girder: GirderConnection) -> dict:
+    items = girder.list_folder_items(SRC_FOLDER_ID)
+    cag_items = [i for i in items if i["name"].endswith(".cag")]
+    if not cag_items:
+        raise FileNotFoundError(f"No .cag file found in source folder {SRC_FOLDER_ID}")
+    cag_path = girder.download_item_to_tempfile(cag_items[0]["_id"], suffix=".cag")
+    return dict(CAGDataset.from_filename(cag_path).measurements)
+
+
+@asset(
+    partitions_def=indentation_partitions,
+    description="Contact surface area for this indentation, looked up from the CAG measurements",
+)
+def extract_contact_area(context: AssetExecutionContext, fetch_cag: dict) -> float:
+    match = re.match(r"^(.+)_Test(\d+)\.zip$", context.partition_key)
+    prefix, test_num = match.group(1), int(match.group(2))
+    cag_key = f"{prefix}_I{test_num:02d}"
+
+    if cag_key not in fetch_cag:
+        raise ValueError(
+            f"No CAG measurement found for {cag_key}. "
+            f"Available: {list(fetch_cag.keys())}"
+        )
+
+    csa = float(fetch_cag[cag_key]["csa"])
+    context.add_output_metadata({"cag_key": cag_key, "csa": csa})
+    return csa
+
+
+@asset(partitions_def=indentation_partitions)
+def fetch_raw_data(context: AssetExecutionContext, girder: GirderConnection) -> str:
+    filename = context.partition_key
+    items = girder.list_folder_items(SRC_FOLDER_ID, name_regex=re.escape(filename))
+    if not items:
+        raise FileNotFoundError(
+            f"No file named {filename!r} found in source folder {SRC_FOLDER_ID}"
+        )
+    fname = girder.download_item_to_tempfile(items[0]["_id"], suffix=".zip")
+    sample_id = filename.split("_")[0]
     context.add_output_metadata({"sample_id": sample_id, "iteration_id": sample_id[:3]})
     return fname
 
 
-@asset(description="Area measurements extracted from the .cag file")
-def area_measurement(context: AssetExecutionContext, area_cag) -> Output[pd.DataFrame]:
-    dataset = CAGDataset.from_filename(area_cag)
-    data = {"Filename": [], "CS": []}
-    for filename, values in dataset.measurements.items():
-        if "_CSR_I" not in filename:
-            continue
-        data["Filename"].append(filename)
-        data["CS"].append(values["csa"])
-
-    df = pd.DataFrame(data)
-    return Output(df, metadata={"preview": df.to_markdown()})
-
-
-@asset(
-    partitions_def=csr_2_partitions,
-    description="Contact surface of individual indentations for CSR",
-)
-def am_csr_2(context: AssetExecutionContext, area_measurement: pd.DataFrame) -> float:
-    sample_id, test_num = context.partition_key.split("_CSR_2_Test")
-    context.add_output_metadata({"sample_id": sample_id, "iteration_id": sample_id[:3]})
-    test_num = int(test_num[:-4])
-    df = area_measurement
-    return (
-        df.loc[df["Filename"] == f"{sample_id}_CSR_I{test_num:02d}", "CS"]
-        .astype(float)
-        .values[0]
-    )
-
-
-@asset(partitions_def=csr_2_partitions)
-def csr_2_files(context: AssetExecutionContext) -> str:
-    sample_id = context.partition_key.split("_CSR_2_Test")[0]
-    context.add_output_metadata({"sample_id": sample_id, "iteration_id": sample_id[:3]})
-    return os.path.join(DATA_PATH, context.partition_key)
-
-
 @multi_asset(
-    name="measured_quantities",
-    partitions_def=csr_2_partitions,
-    description="Time, Load, Displacement, and SR extracted from CSR_2 data",
+    name="extract_indentation_signals",
+    partitions_def=indentation_partitions,
+    description="Time, Load, Displacement, and SR extracted from CSR data",
     outs={
         "time": AssetOut(metadata={"quantity": "Time (s)"}),
         "load": AssetOut(metadata={"quantity": "Load (N)"}),
         "displacement": AssetOut(metadata={"quantity": "Displacement (mm)"}),
         "strain_rate": AssetOut(metadata={"quantity": "SR (mm/s)"}),
     },
-    group_name="measured_quantities",
+    group_name="extract_indentation_signals",
 )
-def measured_quantities(
-    context: AssetExecutionContext, csr_2_files: str, analysis_inputs: pd.DataFrame
+def extract_indentation_signals(
+    context: AssetExecutionContext,
+    fetch_raw_data: str,
+    load_instrument_parameters: pd.DataFrame,
 ) -> Tuple[
     Output[pd.DataFrame],
     Output[pd.DataFrame],
@@ -155,9 +170,11 @@ def measured_quantities(
     Output[pd.DataFrame],
 ]:
     time, load, displacement, SR = export_CSR_laser_data(
-        csr_2_files,
-        analysis_inputs["Actuator parameters"].values,
-        Kf=analysis_inputs.loc[analysis_inputs.index[0], "Frame Stiffness (N/m)"],
+        fetch_raw_data,
+        load_instrument_parameters["Actuator parameters"].values,
+        Kf=load_instrument_parameters.loc[
+            load_instrument_parameters.index[0], "Frame Stiffness (N/m)"
+        ],
         downsample=True,
         downsample_hop=500,
     )
@@ -190,38 +207,33 @@ def measured_quantities(
 
 
 @multi_asset(
-    name="computed_quantities",
-    partitions_def=csr_2_partitions,
-    description="Calculate Hardness and Contact Area from CSR_2 data",
+    name="compute_mechanical_properties",
+    partitions_def=indentation_partitions,
+    description="Calculate Hardness and Contact Area from CSR data",
     outs={
         "hardness": AssetOut(metadata={"quantity": "Hardness (GPa)"}),
         "area": AssetOut(metadata={"quantity": "Area (nm^2)"}),
         "hc_over_h": AssetOut(metadata={"quantity": "hc/h"}),
     },
-    group_name="computed_quantities",
+    group_name="compute_mechanical_properties",
 )
-def computed_quantities(
+def compute_mechanical_properties(
     context: AssetExecutionContext,
-    analysis_inputs: pd.DataFrame,
+    load_instrument_parameters: pd.DataFrame,
     load: pd.DataFrame,
     displacement: pd.DataFrame,
-    am_csr_2: float,
+    extract_contact_area: float,
 ) -> Tuple[Output[pd.DataFrame], Output[pd.DataFrame], Output[pd.Series]]:
     area_coefficients = np.squeeze(
-        analysis_inputs["Tip area coefficients"].astype(float).values
+        load_instrument_parameters["Tip area coefficients"].astype(float).values
     )
     H, A, hc_over_h = calculate_H(
         np.squeeze(load.values),
         np.squeeze(displacement.values),
         area_coefficients,
-        area_max_depth=am_csr_2,
+        area_max_depth=extract_contact_area,
     )
-    df = pd.DataFrame(
-        {
-            "Hardness (GPa)": H,
-            "Area (nm^2)": A,
-        }
-    )
+    df = pd.DataFrame({"Hardness (GPa)": H, "Area (nm^2)": A})
     return (
         Output(
             df["Hardness (GPa)"].to_frame(),
@@ -238,80 +250,116 @@ def computed_quantities(
     )
 
 
-csr_2_job = define_asset_job(
-    "csr_2_files_job",
-    AssetSelection.assets("csr_2_files"),
-    partitions_def=csr_2_partitions,
+indentation_job = define_asset_job(
+    "indentation_job",
+    AssetSelection.assets("fetch_raw_data", "extract_contact_area", "export_results")
+    | AssetSelection.groups(
+        "extract_indentation_signals", "compute_mechanical_properties"
+    ),
+    partitions_def=indentation_partitions,
 )
 
 
-@asset()
-def csr_2_summary(
+@asset(partitions_def=indentation_partitions)
+def export_results(
     context: AssetExecutionContext,
-    hardness: Dict[str, pd.DataFrame],
-    load: Dict[str, pd.DataFrame],
-    time: Dict[str, pd.DataFrame],
-    displacement: Dict[str, pd.DataFrame],
-    hc_over_h: Dict[str, pd.Series],
-    area: Dict[str, pd.DataFrame],
-    strain_rate: Dict[str, pd.DataFrame],
-    analysis_inputs: pd.DataFrame,
+    hardness: pd.DataFrame,
+    load: pd.DataFrame,
+    time: pd.DataFrame,
+    displacement: pd.DataFrame,
+    hc_over_h: pd.Series,
+    area: pd.DataFrame,
+    strain_rate: pd.DataFrame,
+    load_instrument_parameters: pd.DataFrame,
+    girder: GirderConnection,
 ) -> None:
-    analysis_inputs.to_excel("/tmp/foo.xlsx", sheet_name="Analysis Inputs")
-    for key in sorted(hardness.keys()):
-        test_num = int(key.split("_CSR_2_Test")[1][:-4])
-        # The rest compiles the columns of data into a pandas dataframe
-        # outputs this into the excel file.
-        df_results = pd.concat(
-            [
-                time[key],
-                displacement[key],
-                load[key],
-                hardness[key],
-                area[key],
-                strain_rate[key],
-            ],
-            axis=1,
-            sort=False,
-        )
-        df_results.columns = [
-            "TIME",
-            "DEPTH",
-            "LOAD",
-            "HARDNESS",
-            "AREA",
-            "STRAIN RATE",
-        ]
-        df_results.loc[-1] = ["s", "nm", "mN", "GPa", "nm^2", "s^-1"]
-        df_results.index = df_results.index + 1
-        df_results = df_results.sort_index()
-        df_results_hc_over_h = pd.DataFrame(
-            np.column_stack((hc_over_h[key], 0)), columns=["hc_over_h", ""]
-        )
-        with pd.ExcelWriter("/tmp/foo.xlsx", engine="openpyxl", mode="a") as writer:
-            df_results.to_excel(writer, sheet_name=f"Test {test_num}", index=False)
-            df_results_hc_over_h.to_excel(
-                writer, sheet_name=f"Test {test_num} hc_over_h", index=False
-            )
-    return
+    key = context.partition_key
+    stem = key[:-4]
+    output_path = f"/tmp/{stem}.xlsx"
 
+    load_instrument_parameters.to_excel(output_path, sheet_name="Analysis Inputs")
 
-@sensor(job=csr_2_job)
-def csr_2_sensor(context: SensorEvaluationContext):
-    new_csr_2_files = [
-        filename
-        for filename in os.listdir(DATA_PATH)
-        if csr_2_file.match(filename)
-        and not csr_2_partitions.has_partition_key(
-            filename, dynamic_partitions_store=context.instance
-        )
-    ]
-
-    return SensorResult(
-        run_requests=[
-            RunRequest(partition_key=filename) for filename in new_csr_2_files
-        ],
-        dynamic_partitions_requests=[
-            csr_2_partitions.build_add_request(new_csr_2_files)
-        ],
+    df_results = pd.concat(
+        [time, displacement, load, hardness, area, strain_rate],
+        axis=1,
+        sort=False,
     )
+    df_results.columns = ["TIME", "DEPTH", "LOAD", "HARDNESS", "AREA", "STRAIN RATE"]
+    df_results.loc[-1] = ["s", "nm", "mN", "GPa", "nm^2", "s^-1"]
+    df_results.index = df_results.index + 1
+    df_results = df_results.sort_index()
+    df_results_hc_over_h = pd.DataFrame(
+        np.column_stack((hc_over_h, 0)), columns=["hc_over_h", ""]
+    )
+    with pd.ExcelWriter(output_path, engine="openpyxl", mode="a") as writer:
+        df_results.to_excel(writer, sheet_name=stem, index=False)
+        df_results_hc_over_h.to_excel(
+            writer, sheet_name=f"{stem} hc_over_h", index=False
+        )
+
+    filename = key.replace(".zip", ".xlsx")
+    girder.upload_file_to_folder(
+        DST_FOLDER_ID,
+        output_path,
+        mime_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=filename,
+    )
+    context.add_output_metadata({"output_filename": filename})
+
+
+@sensor(job=indentation_job, minimum_interval_seconds=30)
+def indentation_sensor(context: SensorEvaluationContext, girder: GirderConnection):
+    for prereq in ("fetch_cag", "load_instrument_parameters"):
+        if not context.instance.get_latest_materialization_event(AssetKey(prereq)):
+            context.log.info(
+                f"Waiting for {prereq!r} to be materialized before triggering runs."
+            )
+            return None
+
+    last_poll = context.cursor or "1970-01-01T00:00:00.000000+00:00"
+
+    items = girder.list_folder_items(
+        SRC_FOLDER_ID, name_regex=INDENTATION_FILE_RE.pattern
+    )
+    new_items = [i for i in items if i["created"] > last_poll]
+
+    if not new_items:
+        return None
+
+    existing = context.instance.get_dynamic_partitions(indentation_partitions.name)
+    new_partition_keys = []
+    run_requests = []
+
+    for item in new_items:
+        key = item["name"]
+        if key not in existing:
+            new_partition_keys.append(key)
+            existing.append(key)
+
+        if context.instance.get_latest_materialization_event(
+            AssetKey("export_results"), partition_key=key
+        ):
+            context.log.debug(f"Skipping partition {key!r}: already materialized.")
+            continue
+
+        active = context.instance.get_runs(
+            filters=dg.RunsFilter(
+                job_name="indentation_job",
+                statuses=_ACTIVE_RUN_STATUSES,
+                tags={"dagster/partition": key},
+            )
+        )
+        if active:
+            context.log.debug(
+                f"Skipping partition {key!r}: run {active[0].run_id} is already active."
+            )
+            continue
+        run_requests.append(RunRequest(partition_key=key))
+
+    if new_partition_keys:
+        context.instance.add_dynamic_partitions(
+            indentation_partitions.name, new_partition_keys
+        )
+
+    context.update_cursor(datetime.now(timezone.utc).isoformat())
+    return run_requests
