@@ -26,7 +26,7 @@ from dagster import (
 from htmdec_formats import CAGDataset
 
 from .resources import GirderConnection
-from .utils import calculate_H, export_CSR_laser_data
+from .utils import calculate_H, export_CSR_laser_data, get_value_at_depth
 
 indentation_partitions = DynamicPartitionsDefinition(name="indentation")
 
@@ -252,9 +252,75 @@ def compute_mechanical_properties(
     )
 
 
+class ExtractAtDepthConfig(dg.Config):
+    target_depth_nm: float = 2000.0
+
+
+@asset(
+    partitions_def=indentation_partitions,
+    description="Hardness, strain rate, and hc/h extracted at a fixed indentation depth for cross-test comparison",
+    group_name="extract_at_depth",
+)
+def extract_at_depth(
+    context: AssetExecutionContext,
+    config: ExtractAtDepthConfig,
+    hardness: pd.DataFrame,
+    displacement: pd.DataFrame,
+    strain_rate: pd.DataFrame,
+    hc_over_h: pd.Series,
+) -> Output[pd.DataFrame]:
+    depth_arr = displacement.iloc[:, 0].to_numpy()
+    h_arr = hardness.iloc[:, 0].to_numpy()
+    sr_arr = strain_rate.iloc[:, 0].to_numpy()
+
+    # Truncate to loading curve — data includes unloading so the last point
+    # is near zero, not the peak depth.
+    peak_idx = int(np.argmax(depth_arr))
+    loading_depth = depth_arr[: peak_idx + 1]
+    max_depth = float(loading_depth[-1])
+    reached_target = max_depth >= config.target_depth_nm
+
+    if not reached_target:
+        context.log.warning(
+            f"Partition {context.partition_key!r} only reached {max_depth:.1f} nm "
+            f"(target {config.target_depth_nm} nm) — excluded from summary statistics."
+        )
+        actual_depth, hardness_val, sr_val = float("nan"), float("nan"), float("nan")
+    else:
+        idx = get_value_at_depth(loading_depth, config.target_depth_nm)
+        actual_depth = float(depth_arr[idx])
+        hardness_val = float(h_arr[idx])
+        sr_val = float(sr_arr[idx])
+
+    result = pd.DataFrame(
+        {
+            "target_depth_nm": [config.target_depth_nm],
+            "actual_depth_nm": [actual_depth],
+            "hardness_GPa": [hardness_val],
+            "strain_rate_per_s": [sr_val],
+            "hc_over_h": [float(hc_over_h.iloc[0])],
+        }
+    )
+    context.add_output_metadata(
+        {
+            "target_depth_nm": config.target_depth_nm,
+            "max_depth_nm": max_depth,
+            "reached_target": reached_target,
+            "actual_depth_nm": actual_depth if reached_target else None,
+            "hardness_GPa": hardness_val if reached_target else None,
+            "strain_rate_per_s": sr_val if reached_target else None,
+            "hc_over_h": float(hc_over_h.iloc[0]),
+            "preview": result.to_markdown(),
+        }
+    )
+    return Output(result)
+
+
 indentation_job = define_asset_job(
     "indentation_job",
-    AssetSelection.assets("fetch_raw_data", "extract_contact_area", "export_results")
+    AssetSelection.assets(
+        "fetch_raw_data", "extract_contact_area", "export_results", "extract_at_depth"
+    )
     | AssetSelection.groups(
         "extract_indentation_signals", "compute_mechanical_properties"
     ),
