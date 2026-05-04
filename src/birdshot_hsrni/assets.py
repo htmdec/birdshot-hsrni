@@ -4,8 +4,12 @@ from datetime import datetime, timezone
 from typing import Tuple
 
 import dagster as dg
+import matplotlib
 import numpy as np
 import pandas as pd
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 from dagster import (
     AllPartitionMapping,
     AssetIn,
@@ -356,7 +360,7 @@ def export_results(
 
 summary_job = define_asset_job(
     "summary_job",
-    AssetSelection.assets("compute_sample_summary"),
+    AssetSelection.assets("compute_sample_summary", "generate_plots"),
 )
 
 
@@ -433,6 +437,81 @@ def compute_sample_summary(
         }
     )
     return Output(summary_df)
+
+
+_CB_COLORS = [
+    "#377eb8", "#ff7f00", "#4daf4a",
+    "#f781bf", "#a65628", "#984ea3",
+    "#999999", "#e41a1c", "#dede00",
+]
+
+
+@asset(
+    description=(
+        "Bar charts (hardness, strain rate, hc/h) per sample with error bars, "
+        "matching the reference plotting script style. Uploaded to Girder as PNG."
+    ),
+)
+def generate_plots(
+    context: AssetExecutionContext,
+    compute_sample_summary: pd.DataFrame,
+    girder: GirderConnection,
+) -> Output[None]:
+    if compute_sample_summary.empty:
+        context.log.warning("Summary is empty — no plots generated.")
+        return Output(None, metadata={"uploaded_files": "[]"})
+
+    df = compute_sample_summary
+    x_labels = df["sample_prefix"].tolist()
+    x_axis = np.arange(len(x_labels))
+    uploaded = []
+
+    def _save_and_upload(fig, ax, filename):
+        ax.set_xticks(x_axis)
+        ax.set_xticklabels(x_labels, rotation=45, size=15)
+        path = f"/tmp/{filename}"
+        fig.savefig(path, dpi=1200, bbox_inches="tight")
+        plt.close(fig)
+        girder.upload_file_to_folder(
+            DST_FOLDER_ID, path, mime_type="image/png", filename=filename
+        )
+        uploaded.append(filename)
+
+    # Hardness
+    fig, ax = plt.subplots()
+    ax.bar(
+        x_axis, df["hardness_GPa_mean"],
+        color=_CB_COLORS[0], width=0.4,
+        yerr=df["hardness_GPa_std"], capsize=3,
+        label="Quasi-static Hardness",
+    )
+    ax.set_ylabel("Hardness (GPa)", size=15)
+    ax.set_ylim(0, df["hardness_GPa_mean"].max() + 1.0)
+    ax.legend(fontsize=12, loc="upper right")
+    _save_and_upload(fig, ax, "indentation_hardness_chart.png")
+
+    # Strain rate
+    fig, ax = plt.subplots()
+    ax.bar(
+        x_axis, df["strain_rate_per_s_mean"],
+        color=_CB_COLORS[1], width=0.4,
+        yerr=df["strain_rate_per_s_std"], capsize=3,
+    )
+    ax.set_ylabel("Indentation Strain Rate (s⁻¹)", size=15)
+    _save_and_upload(fig, ax, "indentation_strain_rate_chart.png")
+
+    # hc/h
+    fig, ax = plt.subplots()
+    ax.bar(
+        x_axis, df["hc_over_h_mean"],
+        color=_CB_COLORS[2], width=0.4,
+        yerr=df["hc_over_h_std"], capsize=3,
+    )
+    ax.set_ylabel("hc/h", size=15)
+    _save_and_upload(fig, ax, "indentation_hc_over_h_chart.png")
+
+    context.add_output_metadata({"uploaded_files": str(uploaded)})
+    return Output(None, metadata={"uploaded_files": str(uploaded)})
 
 
 @sensor(job=indentation_job, minimum_interval_seconds=30)
