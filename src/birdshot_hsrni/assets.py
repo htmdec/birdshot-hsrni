@@ -26,7 +26,7 @@ from dagster import (
 from htmdec_formats import CAGDataset
 
 from .resources import GirderConnection
-from .utils import calculate_H, export_CSR_laser_data
+from .utils import calculate_H, export_CSR_laser_data, get_value_at_depth
 
 indentation_partitions = DynamicPartitionsDefinition(name="indentation")
 
@@ -252,9 +252,54 @@ def compute_mechanical_properties(
     )
 
 
+class ExtractAtDepthConfig(dg.Config):
+    target_depth_nm: float = 2000.0
+
+
+@asset(
+    partitions_def=indentation_partitions,
+    description="Hardness, strain rate, and hc/h extracted at a fixed indentation depth for cross-test comparison",
+    group_name="extract_at_depth",
+)
+def extract_at_depth(
+    context: AssetExecutionContext,
+    config: ExtractAtDepthConfig,
+    hardness: pd.DataFrame,
+    displacement: pd.DataFrame,
+    strain_rate: pd.DataFrame,
+    hc_over_h: pd.Series,
+) -> Output[pd.DataFrame]:
+    depth_arr = displacement.iloc[:, 0].to_numpy()
+    h_arr = hardness.iloc[:, 0].to_numpy()
+    sr_arr = strain_rate.iloc[:, 0].to_numpy()
+
+    idx = get_value_at_depth(depth_arr, config.target_depth_nm)
+
+    result = pd.DataFrame(
+        {
+            "target_depth_nm": [config.target_depth_nm],
+            "actual_depth_nm": [float(depth_arr[idx])],
+            "hardness_GPa": [float(h_arr[idx])],
+            "strain_rate_per_s": [float(sr_arr[idx])],
+            "hc_over_h": [float(hc_over_h.iloc[0])],
+        }
+    )
+    context.add_output_metadata(
+        {
+            "target_depth_nm": config.target_depth_nm,
+            "actual_depth_nm": float(depth_arr[idx]),
+            "hardness_GPa": float(h_arr[idx]),
+            "preview": result.to_markdown(),
+        }
+    )
+    return Output(result)
+
+
 indentation_job = define_asset_job(
     "indentation_job",
-    AssetSelection.assets("fetch_raw_data", "extract_contact_area", "export_results")
+    AssetSelection.assets(
+        "fetch_raw_data", "extract_contact_area", "export_results", "extract_at_depth"
+    )
     | AssetSelection.groups(
         "extract_indentation_signals", "compute_mechanical_properties"
     ),

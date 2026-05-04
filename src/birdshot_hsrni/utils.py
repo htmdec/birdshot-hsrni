@@ -186,6 +186,15 @@ def export_CSR_laser_data(
     return time.to_numpy(), load.to_numpy(), displacement.to_numpy(), SR.to_numpy()
 
 
+def get_value_at_depth(displacement: np.ndarray, target_nm: float) -> int:
+    """Return the index where displacement first reaches target_nm (nm).
+
+    Uses binary search; clamps to the last index if target exceeds max depth.
+    """
+    idx = int(np.searchsorted(displacement, target_nm))
+    return min(idx, len(displacement) - 1)
+
+
 def get_Am_HTMDEC(filename, sample_id, indent_num):
     print(f"Looking for {sample_id}_CSR_I{indent_num:02d} in {filename}")
     try:
