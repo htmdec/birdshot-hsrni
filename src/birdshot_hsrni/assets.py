@@ -270,8 +270,14 @@ def extract_at_depth(
     hc_over_h: pd.Series,
 ) -> Output[pd.DataFrame]:
     depth_arr = displacement.iloc[:, 0].to_numpy()
+    h_arr = hardness.iloc[:, 0].to_numpy()
+    sr_arr = strain_rate.iloc[:, 0].to_numpy()
 
-    max_depth = float(depth_arr[-1])
+    # Truncate to loading curve — data includes unloading so the last point
+    # is near zero, not the peak depth.
+    peak_idx = int(np.argmax(depth_arr))
+    loading_depth = depth_arr[: peak_idx + 1]
+    max_depth = float(loading_depth[-1])
     reached_target = max_depth >= config.target_depth_nm
 
     if not reached_target:
@@ -281,9 +287,7 @@ def extract_at_depth(
         )
         actual_depth, hardness_val, sr_val = float("nan"), float("nan"), float("nan")
     else:
-        h_arr = hardness.iloc[:, 0].to_numpy()
-        sr_arr = strain_rate.iloc[:, 0].to_numpy()
-        idx = get_value_at_depth(depth_arr, config.target_depth_nm)
+        idx = get_value_at_depth(loading_depth, config.target_depth_nm)
         actual_depth = float(depth_arr[idx])
         hardness_val = float(h_arr[idx])
         sr_val = float(sr_arr[idx])
