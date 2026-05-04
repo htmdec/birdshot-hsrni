@@ -187,10 +187,7 @@ def export_CSR_laser_data(
 
 
 def get_value_at_depth(displacement: np.ndarray, target_nm: float) -> int:
-    """Return the index where displacement first reaches target_nm (nm).
-
-    Uses binary search; clamps to the last index if target exceeds max depth.
-    """
+    """Return the index where displacement first reaches target_nm (nm)."""
     idx = int(np.searchsorted(displacement, target_nm))
     return min(idx, len(displacement) - 1)
 
