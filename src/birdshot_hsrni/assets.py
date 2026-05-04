@@ -12,7 +12,9 @@ from dagster import (
     AssetExecutionContext,
     AssetOut,
     AssetSelection,
+    DagsterEventType,
     DynamicPartitionsDefinition,
+    EventRecordsFilter,
     Output,
     RunRequest,
     SensorEvaluationContext,
@@ -336,9 +338,15 @@ def indentation_sensor(context: SensorEvaluationContext, girder: GirderConnectio
             new_partition_keys.append(key)
             existing.append(key)
 
-        if context.instance.get_latest_materialization_event(
-            AssetKey("export_results"), partition_key=key
-        ):
+        records = context.instance.get_event_records(
+            EventRecordsFilter(
+                event_type=DagsterEventType.ASSET_MATERIALIZATION,
+                asset_key=AssetKey("export_results"),
+                asset_partitions=[key],
+            ),
+            limit=1,
+        )
+        if records:
             context.log.debug(f"Skipping partition {key!r}: already materialized.")
             continue
 
