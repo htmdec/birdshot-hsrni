@@ -7,6 +7,8 @@ import dagster as dg
 import numpy as np
 import pandas as pd
 from dagster import (
+    AllPartitionMapping,
+    AssetIn,
     AssetKey,
     AutoMaterializePolicy,
     AssetExecutionContext,
@@ -350,6 +352,87 @@ def export_results(
         filename=filename,
     )
     context.add_output_metadata({"output_filename": filename})
+
+
+summary_job = define_asset_job(
+    "summary_job",
+    AssetSelection.assets("compute_sample_summary"),
+)
+
+
+@asset(
+    description=(
+        "Mean ± std of hardness, strain rate, and hc/h at the target depth, "
+        "grouped by sample prefix across all replicate tests. "
+        "Run summary_job after all tests for a campaign are processed."
+    ),
+    ins={
+        "extract_at_depth": AssetIn(partition_mapping=AllPartitionMapping()),
+    },
+)
+def compute_sample_summary(
+    context: AssetExecutionContext,
+    extract_at_depth: dict,
+    girder: GirderConnection,
+) -> Output[pd.DataFrame]:
+    records = []
+    for partition_key, df in extract_at_depth.items():
+        match = re.match(r"^(.+)_Test(\d+)\.zip$", partition_key)
+        if not match or df is None or df.empty:
+            continue
+        row = df.iloc[0].to_dict()
+        row["sample_prefix"] = match.group(1)
+        row["partition_key"] = partition_key
+        records.append(row)
+
+    if not records:
+        context.log.warning("No at-depth results found to summarize.")
+        return Output(pd.DataFrame())
+
+    all_df = pd.DataFrame(records)
+
+    summary_rows = []
+    for prefix, group in all_df.groupby("sample_prefix"):
+        n = len(group)
+        h_mean = group["hardness_GPa"].mean()
+        h_std = group["hardness_GPa"].std(ddof=1) if n > 1 else float("nan")
+        sr_mean = group["strain_rate_per_s"].mean()
+        sr_std = group["strain_rate_per_s"].std(ddof=1) if n > 1 else float("nan")
+        hch_mean = group["hc_over_h"].mean()
+        hch_std = group["hc_over_h"].std(ddof=1) if n > 1 else float("nan")
+        summary_rows.append(
+            {
+                "sample_prefix": prefix,
+                "n_tests": n,
+                "target_depth_nm": group["target_depth_nm"].iloc[0],
+                "hardness_GPa_mean": h_mean,
+                "hardness_GPa_std": h_std,
+                "strain_rate_per_s_mean": sr_mean,
+                "strain_rate_per_s_std": sr_std,
+                "hc_over_h_mean": hch_mean,
+                "hc_over_h_std": hch_std,
+            }
+        )
+
+    summary_df = pd.DataFrame(summary_rows).sort_values("sample_prefix").reset_index(drop=True)
+
+    output_path = "/tmp/indentation_summary.xlsx"
+    summary_df.to_excel(output_path, sheet_name="Summary", index=False)
+    girder.upload_file_to_folder(
+        DST_FOLDER_ID,
+        output_path,
+        mime_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename="indentation_summary.xlsx",
+    )
+
+    context.add_output_metadata(
+        {
+            "n_samples": len(summary_df),
+            "n_tests_total": len(records),
+            "preview": summary_df.to_markdown(),
+        }
+    )
+    return Output(summary_df)
 
 
 @sensor(job=indentation_job, minimum_interval_seconds=30)
