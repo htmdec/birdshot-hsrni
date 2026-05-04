@@ -136,7 +136,8 @@ def downsample_list(data, hop):
 
 
 def export_CSR_laser_data(
-    filename, actuator_params, Kf=8e6, downsample=True, downsample_hop=20
+    filename, actuator_params, Kf=8e6, downsample=True, downsample_hop=20,
+    force_cutoff_hz=500.0, displacement_cutoff_hz=100.0,
 ):
     df, delta = bin_to_df(filename)
 
@@ -144,9 +145,7 @@ def export_CSR_laser_data(
     displacement = df.Laser1 / 1000
     force = df.ADC3 / actuator_params[3]
 
-    # Passes filter displacement data set through a low-pass filter.
-    # This is used to calculate the strain rate.
-    sos = butter(N=6, Wn=500, btype="low", analog=False, fs=1 / delta, output="sos")
+    sos = butter(N=6, Wn=force_cutoff_hz, btype="low", analog=False, fs=1 / delta, output="sos")
     force = sosfiltfilt(sos, force)
 
     # Shifts data so that h, force = 0 at the beginning.
@@ -157,9 +156,7 @@ def export_CSR_laser_data(
     displacement -= h0
     time -= t0
 
-    # Passes filter displacement data set through a low-pass filter.
-    # This is used to calculate the strain rate.
-    sos = butter(N=6, Wn=100, btype="low", analog=False, fs=1 / delta, output="sos")
+    sos = butter(N=6, Wn=displacement_cutoff_hz, btype="low", analog=False, fs=1 / delta, output="sos")
     filtered_displacement = sosfiltfilt(sos, displacement)
 
     # Splines data to obtain derivatives.
