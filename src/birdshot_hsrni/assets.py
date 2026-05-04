@@ -149,6 +149,11 @@ def fetch_raw_data(context: AssetExecutionContext, girder: GirderConnection) -> 
     return fname
 
 
+class SignalFilterConfig(dg.Config):
+    force_cutoff_hz: float = 500.0
+    displacement_cutoff_hz: float = 100.0
+
+
 @multi_asset(
     name="extract_indentation_signals",
     partitions_def=indentation_partitions,
@@ -163,6 +168,7 @@ def fetch_raw_data(context: AssetExecutionContext, girder: GirderConnection) -> 
 )
 def extract_indentation_signals(
     context: AssetExecutionContext,
+    config: SignalFilterConfig,
     fetch_raw_data: str,
     load_instrument_parameters: pd.DataFrame,
 ) -> Tuple[
@@ -179,6 +185,8 @@ def extract_indentation_signals(
         ],
         downsample=True,
         downsample_hop=500,
+        force_cutoff_hz=config.force_cutoff_hz,
+        displacement_cutoff_hz=config.displacement_cutoff_hz,
     )
     df = pd.DataFrame(
         {
